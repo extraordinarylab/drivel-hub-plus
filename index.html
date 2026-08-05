@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Reading Between the Frames — DrivelHub+</title>
+<meta name="description" content="DrivelHub+: a benchmark for evaluating implicit, non-literal, and rhetorically layered meaning in short-form social-media videos." />
+<style>
+  :root{
+    --bg:#ffffff;
+    --fg:#1a1a1a;
+    --muted:#5b6470;
+    --accent:#1f4e79;
+    --accent-2:#2b7a78;
+    --card:#f7f9fb;
+    --border:#e4e8ee;
+    --code-bg:#0f172a;
+    --code-fg:#e2e8f0;
+    --shadow:0 6px 24px rgba(20,30,50,.08);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    color:var(--fg);
+    background:var(--bg);
+    line-height:1.65;
+    font-size:16px;
+  }
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .container{max-width:960px;margin:0 auto;padding:0 24px}
+
+  /* HERO */
+  header.hero{
+    padding:72px 24px 56px;
+    background:linear-gradient(135deg,#0f2942 0%,#1f4e79 55%,#2b7a78 100%);
+    color:#fff;
+    text-align:center;
+  }
+  header.hero h1{
+    font-size:2.4rem;
+    line-height:1.25;
+    margin:0 0 18px;
+    font-weight:700;
+    letter-spacing:-0.01em;
+  }
+  header.hero .tagline{
+    font-size:1.05rem;
+    opacity:.92;
+    max-width:720px;
+    margin:0 auto 28px;
+  }
+  .authors{
+    font-size:1rem;
+    margin:0 0 6px;
+    color:#f0f4f8;
+  }
+  .affiliations{
+    font-size:.92rem;
+    opacity:.85;
+    margin:0 0 28px;
+  }
+  .venue-badge{
+    display:inline-block;
+    background:rgba(255,255,255,.15);
+    border:1px solid rgba(255,255,255,.3);
+    padding:6px 14px;
+    border-radius:999px;
+    font-size:.85rem;
+    margin-bottom:22px;
+    letter-spacing:.02em;
+  }
+  .buttons{display:flex;flex-wrap:wrap;justify-content:center;gap:10px;margin-top:10px}
+  .btn{
+    display:inline-flex;align-items:center;gap:8px;
+    padding:10px 18px;
+    border-radius:8px;
+    font-weight:600;font-size:.95rem;
+    transition:transform .12s ease, box-shadow .12s ease, background .12s ease;
+  }
+  .btn-primary{background:#fff;color:var(--accent)}
+  .btn-primary:hover{background:#f1f5f9;text-decoration:none;transform:translateY(-1px)}
+  .btn-ghost{background:transparent;color:#fff;border:1px solid rgba(255,255,255,.55)}
+  .btn-ghost:hover{background:rgba(255,255,255,.1);text-decoration:none}
+
+  /* SECTIONS */
+  section{padding:56px 0;border-bottom:1px solid var(--border)}
+  section:last-of-type{border-bottom:none}
+  h2{
+    font-size:1.55rem;
+    margin:0 0 18px;
+    color:var(--accent);
+    letter-spacing:-0.01em;
+  }
+  h2::before{
+    content:"";
+    display:inline-block;
+    width:6px;height:22px;
+    background:var(--accent-2);
+    border-radius:2px;
+    margin-right:10px;
+    vertical-align:-3px;
+  }
+  h3{font-size:1.1rem;margin:24px 0 8px;color:var(--accent)}
+  p{margin:0 0 14px}
+  .lead{font-size:1.05rem;color:var(--muted)}
+
+  /* CARDS */
+  .grid{display:grid;gap:18px}
+  .grid.cols-2{grid-template-columns:repeat(2,1fr)}
+  .grid.cols-3{grid-template-columns:repeat(3,1fr)}
+  @media (max-width:720px){
+    .grid.cols-2,.grid.cols-3{grid-template-columns:1fr}
+    header.hero h1{font-size:1.8rem}
+  }
+  .card{
+    background:var(--card);
+    border:1px solid var(--border);
+    border-radius:12px;
+    padding:20px;
+    box-shadow:var(--shadow);
+  }
+  .card h3{margin-top:0;color:var(--accent)}
+  .card .num{
+    font-size:2rem;font-weight:700;color:var(--accent-2);
+    display:block;margin-bottom:4px;
+  }
+
+  /* FIGURE */
+  figure{
+    margin:24px 0;
+    text-align:center;
+  }
+  figure img{
+    max-width:100%;
+    height:auto;
+    border-radius:10px;
+    border:1px solid var(--border);
+    box-shadow:var(--shadow);
+  }
+  figcaption{
+    font-size:.9rem;
+    color:var(--muted);
+    margin-top:10px;
+    max-width:760px;
+    margin-left:auto;margin-right:auto;
+    text-align:left;
+  }
+
+  /* TABLE */
+  table{
+    width:100%;
+    border-collapse:collapse;
+    font-size:.92rem;
+    margin:14px 0;
+  }
+  th,td{
+    padding:10px 12px;
+    border-bottom:1px solid var(--border);
+    text-align:left;
+  }
+  th{background:var(--card);color:var(--accent);font-weight:600}
+  tr:hover td{background:#fafcfe}
+
+  /* CODE */
+  pre{
+    background:var(--code-bg);
+    color:var(--code-fg);
+    padding:18px 20px;
+    border-radius:10px;
+    overflow-x:auto;
+    font-size:.85rem;
+    line-height:1.55;
+  }
+  code{font-family:"SF Mono",Menlo,Consolas,monospace}
+  p code,li code{
+    background:#eef3f8;
+    padding:2px 6px;
+    border-radius:4px;
+    color:var(--accent);
+    font-size:.92em;
+  }
+
+  ul{padding-left:20px}
+  li{margin-bottom:6px}
+
+  /* FOOTER */
+  footer{
+    padding:32px 24px;
+    text-align:center;
+    color:var(--muted);
+    font-size:.9rem;
+    background:#f7f9fb;
+  }
+
+  /* Result highlight */
+  .result-pill{
+    display:inline-block;
+    padding:3px 10px;
+    border-radius:999px;
+    font-size:.8rem;
+    font-weight:600;
+    background:#e6f4f1;
+    color:#1b5e5a;
+    margin-right:6px;
+  }
+  .result-pill.warn{background:#fdebd0;color:#8a5a00}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="container">
+    <div class="venue-badge">EMNLP 2026</div>
+    <h1>Reading Between the Frames</h1>
+    <div class="tagline">Interpreting Implicit and Non-literal Meaning in Social-Media Videos</div>
+    <div class="authors">
+      Yang Wang · Yanan Ma · Yiqi Liu · Zi Yan Chang · Chi-Li Chen ·<br/>
+      Chia-Yi Hsiao · Tyler Loakman · Aline Villavicencio · Chenghao Xiao · Chenghua Lin
+    </div>
+    <div class="affiliations">
+      University of Manchester · Durham University · University of Sheffield · University of Exeter
+    </div>
+    <div class="buttons">
+      <a class="btn btn-primary" href="https://github.com/extraordinarylab/drivel-hub-plus" target="_blank" rel="noopener">⭐ GitHub</a>
+      <a class="btn btn-ghost" href="#dataset">Dataset</a>
+      <a class="btn btn-ghost" href="#tasks">Tasks</a>
+      <a class="btn btn-ghost" href="#results">Results</a>
+      <a class="btn btn-ghost" href="#citation">Citation</a>
+    </div>
+  </div>
+</header>
+
+<!-- ABSTRACT -->
+<section id="abstract">
+  <div class="container">
+    <h2>Abstract</h2>
+    <p class="lead">
+      Social-media videos often communicate meanings that go far beyond their visible actions, captions, or speech. A mundane clip can become humorous, ironic, or satirical only through the interaction of multimodal cues and cultural context — making such content a difficult test case for video-language models.
+    </p>
+    <p>
+      We introduce <strong>DrivelHub+</strong>, a benchmark of <strong>1,000 short-form videos</strong>, each paired with a human-written explanation of its implicit narrative. We evaluate current Video LLMs from two complementary perspectives: <em>explanation</em>, where models must articulate the pragmatic meaning in natural language, and <em>representation</em>, where we adapt reasoning-as-retrieval to test whether model embeddings align videos with their implicit narratives. Our benchmark exposes a persistent gap between multimodal <em>perception</em> and pragmatic <em>comprehension</em>: models can often describe what is shown, yet still fail to infer what is meant.
+    </p>
+  </div>
+</section>
+
+<!-- OVERVIEW -->
+<section id="overview">
+  <div class="container">
+    <h2>What is Multimodal Drivelology?</h2>
+    <p>
+      <strong>Drivelology</strong> describes content that appears trivial, absurd, or nonsensical on the surface but is intentionally structured to convey an implicit humor, satire, stance, or social observation. In video, the cue that makes an apparently meaningless clip meaningful may live in speech, on-screen text, visual action, editing, audio, cultural reference — or their interaction.
+    </p>
+    <figure>
+      <img src="assets/figure1.png" alt="Example of a drivelological video" />
+      <figcaption>
+        <strong>Figure 1.</strong> A drivelological video: at the surface level, a sheet of paper is simply divided into four parts. The implicit meaning, however, depends on mapping visual transformations of calligraphy paper art to historically associated punishments (Sima Qian's castration, Shang Yang's dismemberment, Li Si's bisection, Louis XVI's decapitation) through wordplay and cultural knowledge.
+      </figcaption>
+    </figure>
+
+    <div class="grid cols-3" style="margin-top:28px">
+      <div class="card">
+        <span class="num">1,000</span>
+        <h3>Videos</h3>
+        <p>Short-form clips curated from Instagram, Threads, Facebook, YouTube, and TikTok.</p>
+      </div>
+      <div class="card">
+        <span class="num">100%</span>
+        <h3>Human-Annotated</h3>
+        <p>Every video paired with a human-written implicit-narrative explanation — no LLM-generated annotations.</p>
+      </div>
+      <div class="card">
+        <span class="num">2</span>
+        <h3>Evaluation Axes</h3>
+        <p><em>Explanation</em> (open-ended generation) and <em>Representation</em> (bidirectional retrieval).</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- TASKS -->
+<section id="tasks">
+  <div class="container">
+    <h2>Two Evaluation Perspectives</h2>
+    <div class="grid cols-2">
+      <div class="card">
+        <h3>📝 Explanation</h3>
+        <p>
+          Models are prompted to explain the implicit meaning of each video in natural language. We evaluate with a structured <strong>Video LLM-as-a-judge</strong> protocol that scores whether the response captures the main implicit point, identifies the rhetorical mechanism, preserves the social/affective implication, and grounds the interpretation in multimodal evidence — while penalising hallucinations, literal-only, and vague responses.
+        </p>
+      </div>
+      <div class="card">
+        <h3>🔍 Representation (Reasoning-as-Retrieval)</h3>
+        <p>
+          We adapt <em>reasoning-as-retrieval</em> to bidirectional video-text retrieval:
+        </p>
+        <ul>
+          <li><strong>Video → Text:</strong> retrieve the correct implicit narrative for a video.</li>
+          <li><strong>Text → Video:</strong> retrieve the matching video for a written narrative.</li>
+        </ul>
+        <p>
+          This probes whether videos and their implicit interpretations are aligned in representation space, beyond surface lexical or visual overlap.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- DATASET -->
+<section id="dataset">
+  <div class="container">
+    <h2>The DrivelHub+ Dataset</h2>
+    <p>
+      Each instance consists of a video, a human-written implicit-meaning explanation, and structured metadata indicating which modalities support the interpretation. DrivelHub+ is released on Hugging Face under a gated research-use license.
+    </p>
+
+    <h3>Modality Distribution</h3>
+    <table>
+      <thead>
+        <tr><th>Required Modality</th><th>Count</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Text only (T)</td><td>109</td></tr>
+        <tr><td>Audio only (A)</td><td>643</td></tr>
+        <tr><td>Vision only (V)</td><td>4</td></tr>
+        <tr><td>T + A</td><td>7</td></tr>
+        <tr><td>T + V</td><td>48</td></tr>
+        <tr><td>A + V</td><td>177</td></tr>
+        <tr><td>T + A + V</td><td>12</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Language Distribution (top)</h3>
+    <table>
+      <thead>
+        <tr><th>Speech Language</th><th>Count</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>English</td><td>750</td></tr>
+        <tr><td>None (no speech)</td><td>149</td></tr>
+        <tr><td>Mandarin</td><td>78</td></tr>
+        <tr><td>Other / mixed</td><td>23</td></tr>
+      </tbody>
+    </table>
+
+    <p style="margin-top:18px">
+      The dataset is predominantly English by design and is intended for research on implicit multimodal meaning, not as a balanced multilingual benchmark. Sensitive-content metadata is included for transparency and responsible use.
+    </p>
+  </div>
+</section>
+
+<!-- RESULTS -->
+<section id="results">
+  <div class="container">
+    <h2>Key Findings</h2>
+
+    <h3>🧠 Explanation: Thinking helps — but only when grounded</h3>
+    <p>
+      <span class="result-pill">Qwen3.5-27B (thinking)</span> achieves the strongest generation results (Total 9.52 / 12), but the comparison between thinking and non-thinking variants shows that test-time reasoning is <em>not</em> uniformly beneficial. Effective reasoning must preserve the specific visual or textual transition that carries the implicit meaning — verbose traces without decisive evidence often miss the punchline.
+    </p>
+
+    <h3>👁️ Modality Ablations: Vision dominates</h3>
+    <p>
+      <span class="result-pill warn">Removing vision → large drops</span>
+      Removing the video stream causes much larger degradation than removing audio, especially for textual or visual evidence groups. The video stream supports not only actions and facial expressions, but also OCR-like access to on-screen captions, subtitles, and overlaid text.
+    </p>
+    <p>
+      <span class="result-pill">Audio → selective</span>
+      Audio removal has weaker and more heterogeneous effects; for some models and groups, scores even improve, suggesting audio is used selectively and can sometimes introduce distracting cues.
+    </p>
+
+    <h3>📊 Representation: Embedding-native ≫ adapted generative models</h3>
+    <p>
+      Embedding-native omni-modal models (notably <strong>LCO-Omni</strong>) substantially outperform generative Video LLMs adapted for retrieval in both directions. LCO-Omni-7B reaches <strong>R@1 = 75.8</strong> in text-to-video and LCO-Omni-3B-2605 reaches <strong>R@1 = 68.3</strong> in video-to-text — far above the best adapted generative models.
+    </p>
+    <p>
+      The two retrieval directions are <em>asymmetric</em>: per-query rankings of LCO-Omni-7B and LCO-Omni-3B-2605 diverge dramatically (one retrieves at rank 1 where the other ranks at 744+), showing that text-to-video and video-to-text probe distinct capabilities. We therefore report both rather than averaging.
+    </p>
+
+    <figure>
+      <img src="assets/figure2.png" alt="Modality ablation heatmap" />
+      <figcaption>
+        <strong>Figure 2.</strong> Input-stream ablation effects grouped by interpretive-evidence label. Removing vision causes much larger drops than removing audio, highlighting the central role of visual frames (and on-screen text) in drivelological interpretation.
+      </figcaption>
+    </figure>
+  </div>
+</section>
+
+<!-- EXAMPLES -->
+<section id="examples">
+  <div class="container">
+    <h2>Illustrative Examples</h2>
+    <div class="grid cols-2">
+      <div class="card">
+        <h3>On-screen Wordplay</h3>
+        <p>
+          <em>Surface:</em> Two cats interact against a fiery cityscape.<br/>
+          <em>Implicit:</em> A pun — not <em>"kidnapping"</em> (the crime), but <em>"kid napping"</em> (a child sleeping). Requires only on-screen text.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Historical + Pragmatic</h3>
+        <p>
+          <em>Surface:</em> A press-conference remark about "surprise."<br/>
+          <em>Implicit:</em> Sarcastic weaponisation of Pearl-Harbor history to justify military secrecy. Requires speech + historical knowledge.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Visual Framing Pun</h3>
+        <p>
+          <em>Surface:</em> An artist painting a portrait of a smiling man.<br/>
+          <em>Implicit:</em> The artist switches the canvas from portrait to landscape orientation, humorously implying the subject is too wide for a vertical frame.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Text × Vision Interaction</h3>
+        <p>
+          <em>Surface:</em> A man dances confidently after leaving the toilet.<br/>
+          <em>Implicit:</em> He plays on the double meaning of "girls asking him out" — he was actually asked to leave the women's restroom.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- RESOURCES -->
+<section id="resources">
+  <div class="container">
+    <h2>Resources</h2>
+    <div class="grid cols-3">
+      <div class="card">
+        <h3>💻 Code</h3>
+        <p>Evaluation scripts, prompts, and retrieval harness.</p>
+        <a href="https://github.com/extraordinarylab/drivel-hub-plus" target="_blank" rel="noopener">github.com/extraordinarylab/drivel-hub-plus →</a>
+      </div>
+      <div class="card">
+        <h3>🗂️ Dataset</h3>
+        <p>DrivelHub+ on Hugging Face (gated research-use license).</p>
+        <a href="https://huggingface.co/datasets/extraordinarylab/drivel-hub-plus" target="_blank" rel="noopener">Hugging Face →</a>
+      </div>
+      <div class="card">
+        <h3>📄 Paper</h3>
+        <p>Read the full paper (EMNLP 2026).</p>
+        <a href="#" onclick="alert('Add your arXiv / ACL anthology link here');return false;">Paper →</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CITATION -->
+<section id="citation">
+  <div class="container">
+    <h2>Citation</h2>
+    <pre><code>@inproceedings{wang2026drivelhubplus,
+  title     = {Reading Between the Frames: Interpreting Implicit and
+               Non-literal Meaning in Social Media Videos},
+  author    = {Wang, Yang and Ma, Yanan and Liu, Yiqi and Chang, Zi Yan
+               and Chen, Chi-Li and Hsiao, Chia-Yi and Loakman, Tyler
+               and Villavicencio, Aline and Xiao, Chenghao and Lin, Chenghua},
+  booktitle = {Proceedings of the 2026 Conference on Empirical Methods
+               in Natural Language Processing (EMNLP 2026)},
+  year      = {2026}
+}</code></pre>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    © 2026 DrivelHub+ · Built for the EMNLP 2026 paper
+    <em>"Reading Between the Frames."</em>
+  </div>
+</footer>
+
+</body>
+</html>
