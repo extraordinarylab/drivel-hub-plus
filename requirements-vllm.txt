@@ -1,0 +1,16 @@
+# Validated on ARM64 NVIDIA GH200 nodes with a CUDA 12.x-compatible driver.
+# Install with: uv pip install -r requirements-vllm.txt --torch-backend=cu129
+
+vllm @ https://github.com/vllm-project/vllm/releases/download/v0.19.1/vllm-0.19.1-cp38-abi3-manylinux_2_31_aarch64.whl
+torch==2.10.0
+torchvision==0.25.0
+torchaudio==2.10.0
+transformers==5.5.3
+flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_aarch64.whl
+numpy==2.2.6
+numba==0.61.2
+setuptools==80.10.2
+fsspec==2026.6.0
+openai==3.1.0
+hjson==3.1.0
+av==18.1.0

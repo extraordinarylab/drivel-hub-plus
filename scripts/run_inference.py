@@ -13,13 +13,15 @@ import base64
 import csv
 import json
 import os
-import subprocess
 import tempfile
 import time
+import wave
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+import av
 from openai import OpenAI
 
 
@@ -111,51 +113,87 @@ PROMPTS = {
 }
 
 
-def run_checked(command: list[str]) -> subprocess.CompletedProcess[str]:
-    try:
-        return subprocess.run(command, check=True, capture_output=True, text=True)
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"Required executable not found: {command[0]}") from exc
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(f"Command failed: {' '.join(command)}\n{exc.stderr}") from exc
+def final_answer(text: str) -> str:
+    """Remove reasoning leaked by models that emit only a closing think tag."""
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[1]
+    return text.strip()
 
 
 def has_audio(path: Path) -> bool:
-    result = run_checked([
-        "ffprobe", "-v", "error", "-select_streams", "a",
-        "-show_entries", "stream=index", "-of", "csv=p=0", str(path),
-    ])
-    return bool(result.stdout.strip())
+    with av.open(str(path)) as container:
+        return bool(container.streams.audio)
+
+
+def extract_audio(video_path: Path, output_path: Path) -> None:
+    with av.open(str(video_path)) as container:
+        if not container.streams.audio:
+            raise ValueError("video has no audio stream")
+        stream = container.streams.audio[0]
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
+        with wave.open(str(output_path), "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(16000)
+            for frame in container.decode(stream):
+                for resampled in resampler.resample(frame):
+                    output.writeframes(resampled.to_ndarray().tobytes())
+            for resampled in resampler.resample(None):
+                output.writeframes(resampled.to_ndarray().tobytes())
+
+
+def strip_audio(video_path: Path, output_path: Path) -> None:
+    """Remux the first video stream into a new MP4 without audio streams."""
+    with av.open(str(video_path)) as source:
+        if not source.streams.video:
+            raise ValueError("input has no video stream")
+        source_stream = source.streams.video[0]
+        with av.open(str(output_path), mode="w") as destination:
+            destination_stream = destination.add_stream_from_template(source_stream)
+            for packet in source.demux(source_stream):
+                if packet.dts is None:
+                    continue
+                packet.stream = destination_stream
+                destination.mux(packet)
 
 
 @contextmanager
-def prepared_media(video_path: Path, mode: str) -> Iterator[tuple[Path, str, str]]:
+def prepared_media(
+    video_path: Path, mode: str, use_audio_in_video: bool = False
+) -> Iterator[list[tuple[Path, str, str]]]:
     if mode == "full":
-        yield video_path, "video", "video/mp4"
+        if not use_audio_in_video:
+            yield [(video_path, "video", "video/mp4")]
+            return
+
+        if not has_audio(video_path):
+            yield [(video_path, "video", "video/mp4")]
+            return
+        with tempfile.TemporaryDirectory(prefix="drivelhub-") as tmp:
+            audio_path = Path(tmp) / "audio.wav"
+            extract_audio(video_path, audio_path)
+            # vLLM serve does not interleave embedded video audio for Qwen3-Omni.
+            # The model's official serving example sends video and audio separately.
+            yield [
+                (video_path, "video", "video/mp4"),
+                (audio_path, "audio", "audio/wav"),
+            ]
         return
 
     if mode == "without-audio":
         with tempfile.TemporaryDirectory(prefix="drivelhub-") as tmp:
             output = Path(tmp) / "vision_only.mp4"
-            run_checked([
-                "ffmpeg", "-y", "-i", str(video_path), "-an", "-c:v", "libx264",
-                "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart", str(output),
-            ])
-            yield output, "video", "video/mp4"
+            strip_audio(video_path, output)
+            yield [(output, "video", "video/mp4")]
         return
 
     if not has_audio(video_path):
         raise ValueError("video has no audio stream")
 
     with tempfile.TemporaryDirectory(prefix="drivelhub-") as tmp:
-        output = Path(tmp) / "audio_only.mp3"
-        run_checked([
-            "ffmpeg", "-y", "-i", str(video_path), "-vn", "-map", "0:a:0",
-            "-ac", "1", "-ar", "16000", "-codec:a", "libmp3lame",
-            "-b:a", "64k", str(output),
-        ])
-        yield output, "audio", "audio/mpeg"
+        output = Path(tmp) / "audio_only.wav"
+        extract_audio(video_path, output)
+        yield [(output, "audio", "audio/wav")]
 
 
 def data_url(path: Path, mime_type: str) -> str:
@@ -172,34 +210,46 @@ def generate(
     max_tokens: int,
     temperature: float,
     top_p: float,
-    top_k: int,
+    top_k: int | None,
+    use_audio_in_video: bool,
     max_retries: int,
 ) -> str:
-    with prepared_media(video_path, mode) as (media_path, media_kind, mime_type):
-        media = {
-            "type": f"{media_kind}_url",
-            f"{media_kind}_url": {"url": data_url(media_path, mime_type)},
-        }
-        content = [media, {"type": "text", "text": PROMPTS[mode]}]
+    with prepared_media(video_path, mode, use_audio_in_video) as prepared:
+        media = [
+            {
+                "type": f"{media_kind}_url",
+                f"{media_kind}_url": {"url": data_url(media_path, mime_type)},
+            }
+            for media_path, media_kind, mime_type in prepared
+        ]
+        content = [*media, {"type": "text", "text": PROMPTS[mode]}]
 
         last_error: Exception | None = None
         for attempt in range(1, max_retries + 1):
             try:
+                extra_body: dict = {
+                    "chat_template_kwargs": {
+                        "enable_thinking": enable_thinking,
+                        "thinking": enable_thinking,
+                    },
+                }
+                if top_k is not None:
+                    extra_body["top_k"] = top_k
                 response = client.chat.completions.create(
                     model=model,
                     messages=[{"role": "user", "content": content}],
                     max_tokens=max_tokens,
                     temperature=temperature,
                     top_p=top_p,
-                    extra_body={
-                        "top_k": top_k,
-                        "chat_template_kwargs": {"enable_thinking": enable_thinking},
-                    },
+                    extra_body=extra_body,
                 )
                 answer = response.choices[0].message.content
                 if not answer or not answer.strip():
                     raise RuntimeError("empty model response")
-                return answer.strip()
+                answer = final_answer(answer)
+                if not answer:
+                    raise RuntimeError("empty model response after removing reasoning")
+                return answer
             except Exception as exc:  # API clients expose backend-specific errors.
                 last_error = exc
                 print(f"retry {attempt}/{max_retries} for {video_path.name}: {exc}")
@@ -230,7 +280,16 @@ def append_jsonl(path: Path, row: dict) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Model name exposed by vLLM.")
-    parser.add_argument("--base-url", default="http://localhost:8000/v1")
+    parser.add_argument(
+        "--base-url",
+        action="append",
+        dest="base_urls",
+        help=(
+            "OpenAI-compatible endpoint. Repeat to distribute concurrent "
+            "requests across multiple local vLLM replicas (default: "
+            "http://localhost:8000/v1)."
+        ),
+    )
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--metadata-csv", type=Path, default=Path("metadata.csv"))
     parser.add_argument("--output-jsonl", type=Path, required=True)
@@ -239,24 +298,76 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=8192)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.8)
-    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        help="Optional override; by default use the checkpoint generation config.",
+    )
+    parser.add_argument(
+        "--use-audio-in-video",
+        action="store_true",
+        help=(
+            "Extract and attach the video's audio track as a separate audio "
+            "input. Required for Qwen3-Omni full-video inference via vLLM serve."
+        ),
+    )
     parser.add_argument("--max-retries", type=int, default=10)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of concurrent requests sent to vLLM (default: 1).",
+    )
     parser.add_argument("--limit", type=int)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
+def infer_row(
+    row: dict[str, str], args: argparse.Namespace, client: OpenAI
+) -> dict:
+    filename = row["file"]
+    video_path = args.data_dir / filename
+    record = {
+        **row,
+        "video_path": str(video_path),
+        "input_mode": args.mode,
+        "remove_audio": args.mode == "without-audio",
+        "remove_vision": args.mode == "without-vision",
+    }
+    try:
+        record["implicit_meaning"] = generate(
+            client, args.model, video_path, args.mode, args.enable_thinking,
+            args.max_tokens, args.temperature, args.top_p, args.top_k,
+            args.use_audio_in_video,
+            args.max_retries,
+        )
+    except Exception as exc:
+        record["implicit_meaning"] = ""
+        record["error"] = str(exc)
+        print(f"error: {filename}: {exc}", flush=True)
+    return record
+
+
 def main() -> None:
     args = parse_args()
+    if args.workers < 1:
+        raise ValueError("--workers must be at least 1")
+    if args.use_audio_in_video and args.mode != "full":
+        raise ValueError("--use-audio-in-video is only valid with --mode full")
     if args.overwrite and args.output_jsonl.exists():
         args.output_jsonl.unlink()
     completed = load_completed(args.output_jsonl)
-    client = OpenAI(base_url=args.base_url, api_key=os.getenv("OPENAI_API_KEY", "EMPTY"))
+    base_urls = args.base_urls or ["http://localhost:8000/v1"]
+    clients = [
+        OpenAI(base_url=url, api_key=os.getenv("OPENAI_API_KEY", "EMPTY"))
+        for url in base_urls
+    ]
 
     with args.metadata_csv.open(encoding="utf-8-sig", newline="") as handle:
         rows = list(csv.DictReader(handle))
 
-    processed = 0
+    pending: list[dict[str, str]] = []
     for row in rows:
         filename = row.get("file", "")
         if not filename.endswith(".mp4") or filename in completed:
@@ -265,29 +376,32 @@ def main() -> None:
         if not video_path.is_file():
             print(f"missing: {video_path}")
             continue
-
-        record = {
-            **row,
-            "video_path": str(video_path),
-            "input_mode": args.mode,
-            "remove_audio": args.mode == "without-audio",
-            "remove_vision": args.mode == "without-vision",
-        }
-        print(f"processing: {filename}")
-        try:
-            record["latent_meaning"] = generate(
-                client, args.model, video_path, args.mode, args.enable_thinking,
-                args.max_tokens, args.temperature, args.top_p, args.top_k,
-                args.max_retries,
-            )
-        except Exception as exc:
-            record["latent_meaning"] = ""
-            record["error"] = str(exc)
-            print(f"error: {filename}: {exc}")
-        append_jsonl(args.output_jsonl, record)
-        processed += 1
-        if args.limit is not None and processed >= args.limit:
+        pending.append(row)
+        if args.limit is not None and len(pending) >= args.limit:
             break
+
+    processed = 0
+    if args.workers == 1:
+        for row in pending:
+            print(f"processing: {row['file']}", flush=True)
+            append_jsonl(args.output_jsonl, infer_row(row, args, clients[0]))
+            processed += 1
+    else:
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {}
+            for index, row in enumerate(pending):
+                print(f"processing: {row['file']}", flush=True)
+                future = executor.submit(
+                    infer_row, row, args, clients[index % len(clients)]
+                )
+                futures[future] = row["file"]
+            for future in as_completed(futures):
+                append_jsonl(args.output_jsonl, future.result())
+                processed += 1
+                print(
+                    f"completed: {futures[future]} ({processed}/{len(pending)})",
+                    flush=True,
+                )
 
     print(f"done: wrote {processed} rows to {args.output_jsonl}")
 

@@ -9,11 +9,15 @@ MODEL=$1
 shift
 
 PORT=${PORT:-8000}
+VLLM_HOST=${VLLM_HOST:-0.0.0.0}
 TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-4}
+PIPELINE_PARALLEL_SIZE=${PIPELINE_PARALLEL_SIZE:-1}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.92}
 DTYPE=${DTYPE:-bfloat16}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-}
 REASONING_PARSER=${REASONING_PARSER:-}
+MM_PROCESSOR_CACHE_GB=${MM_PROCESSOR_CACHE_GB:-0}
+ENFORCE_EAGER=${ENFORCE_EAGER:-false}
 
 if ! command -v vllm >/dev/null 2>&1; then
     echo "Error: vllm is not available on PATH." >&2
@@ -22,12 +26,15 @@ fi
 
 args=(
     vllm serve "$MODEL"
+    --host "$VLLM_HOST"
     --port "$PORT"
     --tensor-parallel-size "$TENSOR_PARALLEL_SIZE"
+    --pipeline-parallel-size "$PIPELINE_PARALLEL_SIZE"
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
     --dtype "$DTYPE"
     --enable-prefix-caching
     --trust-remote-code
+    --mm-processor-cache-gb "$MM_PROCESSOR_CACHE_GB"
 )
 
 if [[ -n "$MAX_MODEL_LEN" ]]; then
@@ -38,5 +45,17 @@ if [[ -n "$REASONING_PARSER" ]]; then
     args+=(--reasoning-parser "$REASONING_PARSER")
 fi
 
-echo "Serving $MODEL at http://localhost:$PORT/v1" >&2
+case "${ENFORCE_EAGER,,}" in
+    1|true|yes)
+        args+=(--enforce-eager)
+        ;;
+    0|false|no)
+        ;;
+    *)
+        echo "Error: ENFORCE_EAGER must be true/false, yes/no, or 1/0." >&2
+        exit 2
+        ;;
+esac
+
+echo "Serving $MODEL at http://$VLLM_HOST:$PORT/v1" >&2
 exec "${args[@]}" "$@"

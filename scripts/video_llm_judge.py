@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from openai import OpenAI
@@ -18,7 +19,7 @@ Your job is to judge semantic understanding, not style.
 
 You will be shown a video along with:
 - Annotation: a human-provided description of the video's intended implicit narrative or underlying meaning.
-- Latent Meaning: a model-generated interpretation of the video's core meaning.
+- Implicit Meaning: a model-generated interpretation of the video's core meaning.
 
 Scoring dimensions:
 - core_intent: Did the model capture the main intended implicit narrative or core message?
@@ -47,7 +48,7 @@ Interpretation guide:
 - A partially correct answer that captures the video's implicit point should score much higher than a polished but purely literal answer.
 - Do not require exact wording match.
 - Minor differences in phrasing, detail level, or style are acceptable if the core meaning is preserved.
-- If the Annotation is vague or short, judge whether the Latent Meaning is a reasonable elaboration of it given the video.
+- If the Annotation is vague or short, judge whether the Implicit Meaning is a reasonable elaboration of it given the video.
 - Be strict with hallucinations.
 - Penalize interpretations that substitute a different implicit meaning, even if they sound plausible.
 - Penalize answers that only describe visible actions, objects, captions, speech, or surface events.
@@ -56,9 +57,9 @@ Interpretation guide:
 - Keep reasoning_short concise.
 
 Alignment rule:
-- aligned should be true only when the Latent Meaning substantially captures the same overall implicit meaning as the Annotation.
+- aligned should be true only when the Implicit Meaning substantially captures the same overall implicit meaning as the Annotation.
 - If core_intent is 0, aligned must be false.
-- If the Latent Meaning is empty, irrelevant, or purely surface-level, aligned must be false.
+- If the Implicit Meaning is empty, irrelevant, or purely surface-level, aligned must be false.
 - If hallucination_penalty is 3, aligned should usually be false unless the hallucination is unrelated to the core interpretation.
 - If literal_only_penalty is 3, aligned should usually be false unless the Annotation itself is mostly literal.
 
@@ -79,7 +80,7 @@ Return only valid JSON with exactly these fields:
 The reasoning_short field must be written in English regardless of the video's language.
 
 Annotation: {annotation}
-Latent Meaning: {latent_meaning}
+Implicit Meaning: {implicit_meaning}
 
 Return only valid JSON."""
 
@@ -128,13 +129,21 @@ def judge_one(
     model: str,
     video_path: Path,
     annotation: str,
-    latent_meaning: str,
+    implicit_meaning: str,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
+    presence_penalty: float,
+    repetition_penalty: float,
+    enable_thinking: bool,
     max_retries: int,
 ) -> dict:
     encoded = base64.b64encode(video_path.read_bytes()).decode("ascii")
     content = [
         {"type": "text", "text": JUDGE_PROMPT.format(
-            annotation=annotation, latent_meaning=latent_meaning,
+            annotation=annotation, implicit_meaning=implicit_meaning,
         )},
         {"type": "video_url", "video_url": {
             "url": f"data:video/mp4;base64,{encoded}",
@@ -143,16 +152,32 @@ def judge_one(
     last_error: Exception | None = None
     for attempt in range(1, max_retries + 1):
         try:
+            request_content = content
+            if last_error is not None:
+                request_content = content + [{
+                    "type": "text",
+                    "text": (
+                        f"Your previous response was invalid: {last_error}. "
+                        "Return a new JSON object and strictly obey every integer "
+                        "range stated above; do not reuse the invalid value."
+                    ),
+                }]
             response = client.chat.completions.create(
                 model=model,
-                messages=[{"role": "user", "content": content}],
+                messages=[{"role": "user", "content": request_content}],
                 response_format={"type": "json_object"},
-                max_tokens=16384,
-                temperature=0.7,
-                top_p=0.8,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                presence_penalty=presence_penalty,
                 extra_body={
-                    "top_k": 20,
-                    "chat_template_kwargs": {"enable_thinking": False},
+                    "top_k": top_k,
+                    "min_p": min_p,
+                    "repetition_penalty": repetition_penalty,
+                    "chat_template_kwargs": {
+                        "enable_thinking": enable_thinking,
+                        "thinking": enable_thinking,
+                    },
                 },
             )
             answer = response.choices[0].message.content
@@ -186,69 +211,152 @@ def completed_files(path: Path) -> set[str]:
     return {row["file"] for row in read_jsonl(path) if "file" in row}
 
 
+def remove_error_rows(path: Path) -> int:
+    """Atomically remove explicit judge failures so resume can retry them."""
+    if not path.exists():
+        return 0
+    rows = read_jsonl(path)
+    kept = [row for row in rows if not row.get("judge_error")]
+    removed = len(rows) - len(kept)
+    if not removed:
+        return 0
+    temporary = path.with_name(f".{path.name}.retry-errors.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        for row in kept:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    temporary.replace(path)
+    return removed
+
+
 def append_jsonl(path: Path, row: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def judge_row(row: dict, args: argparse.Namespace, client: OpenAI) -> dict:
+    filename = row["file"]
+    video_path = args.data_dir / filename
+    record = dict(row)
+    try:
+        judgment = judge_one(
+            client, args.model, video_path, str(row["annotation"]).strip(),
+            str(row["implicit_meaning"]).strip(), args.max_tokens,
+            args.temperature, args.top_p, args.top_k, args.min_p,
+            args.presence_penalty, args.repetition_penalty,
+            args.enable_thinking, args.max_retries,
+        )
+        for key, value in judgment.items():
+            output_key = (
+                "judge_reason" if key == "reasoning_short" else f"judge_{key}"
+            )
+            record[output_key] = value
+    except Exception as exc:
+        record["judge_aligned"] = None
+        record["judge_error"] = str(exc)
+        print(f"error: {filename}: {exc}", flush=True)
+    return record
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Judge model exposed by vLLM.")
-    parser.add_argument("--base-url", default="http://localhost:8000/v1")
+    parser.add_argument(
+        "--base-url",
+        action="append",
+        dest="base_urls",
+        help=(
+            "OpenAI-compatible endpoint. Repeat to distribute concurrent "
+            "requests across multiple local replicas (default: "
+            "http://localhost:8000/v1)."
+        ),
+    )
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--input-jsonl", type=Path, required=True)
     parser.add_argument("--output-jsonl", type=Path, required=True)
+    parser.add_argument("--max-tokens", type=int, default=16384)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top-p", type=float, default=0.8)
+    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--min-p", type=float, default=0.0)
+    parser.add_argument("--presence-penalty", type=float, default=1.5)
+    parser.add_argument("--repetition-penalty", type=float, default=1.0)
+    parser.add_argument("--enable-thinking", action="store_true")
     parser.add_argument("--max-retries", type=int, default=10)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--retry-error-rows",
+        action="store_true",
+        help=(
+            "Remove rows containing judge_error from the existing output and "
+            "retry only those rows during normal resume."
+        ),
+    )
     parser.add_argument("--include-error-rows", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.workers < 1:
+        raise ValueError("--workers must be at least 1")
     if args.overwrite and args.output_jsonl.exists():
         args.output_jsonl.unlink()
+    if args.retry_error_rows:
+        removed = remove_error_rows(args.output_jsonl)
+        print(f"retrying {removed} explicit error rows")
     completed = completed_files(args.output_jsonl)
-    client = OpenAI(base_url=args.base_url, api_key=os.getenv("OPENAI_API_KEY", "EMPTY"))
-    processed = 0
+    base_urls = args.base_urls or ["http://localhost:8000/v1"]
+    clients = [
+        OpenAI(base_url=url, api_key=os.getenv("OPENAI_API_KEY", "EMPTY"))
+        for url in base_urls
+    ]
 
+    pending = []
     for row in read_jsonl(args.input_jsonl):
         filename = row.get("file", "")
         if not filename.endswith(".mp4") or filename in completed:
             continue
         annotation = str(row.get("annotation", "")).strip()
-        latent_meaning = str(row.get("latent_meaning", "")).strip()
+        implicit_meaning = str(row.get("implicit_meaning", "")).strip()
         if not annotation:
             print(f"skipping {filename}: missing annotation")
             continue
-        if not args.include_error_rows and (not latent_meaning or row.get("error")):
+        if not args.include_error_rows and (not implicit_meaning or row.get("error")):
             print(f"skipping {filename}: missing generation or inference error")
             continue
         video_path = args.data_dir / filename
         if not video_path.is_file():
             print(f"missing: {video_path}")
             continue
-
-        record = dict(row)
-        print(f"judging: {filename}")
-        try:
-            judgment = judge_one(
-                client, args.model, video_path, annotation, latent_meaning,
-                args.max_retries,
-            )
-            for key, value in judgment.items():
-                output_key = "judge_reason" if key == "reasoning_short" else f"judge_{key}"
-                record[output_key] = value
-        except Exception as exc:
-            record["judge_aligned"] = None
-            record["judge_error"] = str(exc)
-            print(f"error: {filename}: {exc}")
-        append_jsonl(args.output_jsonl, record)
-        processed += 1
-        if args.limit is not None and processed >= args.limit:
+        pending.append(row)
+        if args.limit is not None and len(pending) >= args.limit:
             break
+
+    processed = 0
+    if args.workers == 1:
+        for row in pending:
+            print(f"judging: {row['file']}", flush=True)
+            append_jsonl(args.output_jsonl, judge_row(row, args, clients[0]))
+            processed += 1
+    else:
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {}
+            for index, row in enumerate(pending):
+                print(f"judging: {row['file']}", flush=True)
+                future = executor.submit(
+                    judge_row, row, args, clients[index % len(clients)]
+                )
+                futures[future] = row["file"]
+            for future in as_completed(futures):
+                append_jsonl(args.output_jsonl, future.result())
+                processed += 1
+                print(
+                    f"judged: {futures[future]} ({processed}/{len(pending)})",
+                    flush=True,
+                )
 
     judged = [r for r in read_jsonl(args.output_jsonl) if r.get("judge_aligned") is not None]
     if judged:
