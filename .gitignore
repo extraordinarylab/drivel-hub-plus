@@ -218,3 +218,31 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# staging copies for the annotation artifact upload
+ann/
+
+# ---------------------------------------------------------------------------
+# Research artefacts, deliberately not published here.
+#
+# The dataset (clips, metadata.csv, qrels.json) is released gated on
+# HuggingFace; model outputs and judge gradings are reproducible by re-running
+# the pipeline. Everything below lives in the private archive branch instead.
+embeddings/
+logs/
+judgments/
+outputs
+outputs/
+cascade/
+retrieval/
+figures/
+latex/
+annotation/
+docs/
+metadata*.csv
+qrels.json
+*.mp4
+*.pdf
+*.png
+!assets/*.png
+*.sbatch

@@ -7,11 +7,17 @@ import argparse
 import base64
 import json
 import os
+import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from openai import OpenAI
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from scripts.run_inference import extract_audio, has_audio, split_wav
 
 
 JUDGE_PROMPT = """You are grading answers in a benchmark for implicit multimodal Drivelology understanding.
@@ -95,7 +101,18 @@ BOUNDS = {
 }
 
 
-def parse_json_object(text: str) -> dict:
+def parse_json_object(text: str, clamp: bool = False) -> dict:
+    """Parse and validate one judgment.
+
+    With `clamp`, an integer that lands outside its rubric range is pulled back
+    to the nearest bound and the field is recorded in `clamped_fields` instead
+    of the whole judgment being thrown away. This is only ever used on the last
+    attempt: a judge that answers `rhetorical_signal: 4` on a 0-3 scale ten
+    times in a row has clearly said "the maximum", and dropping the item loses
+    more information than repairing it. Anything else -- a non-integer, a
+    malformed object, broken JSON -- still raises, because there is nothing
+    unambiguous to repair.
+    """
     text = text.strip()
     if text.startswith("```"):
         parts = text.split("```")
@@ -106,12 +123,19 @@ def parse_json_object(text: str) -> dict:
         raise ValueError("judge response is not a JSON object")
     if type(value.get("aligned")) is not bool:
         raise ValueError("aligned must be a JSON boolean")
+    clamped: list[str] = []
     for field, (minimum, maximum) in BOUNDS.items():
         score = value.get(field)
+        if type(score) is int and not minimum <= score <= maximum and clamp:
+            value[field] = min(max(score, minimum), maximum)
+            clamped.append(f"{field}:{score}->{value[field]}")
+            continue
         if type(score) is not int or not minimum <= score <= maximum:
             raise ValueError(f"{field} must be an integer in [{minimum}, {maximum}]")
     if not isinstance(value.get("reasoning_short", ""), str):
         raise ValueError("reasoning_short must be a string")
+    if clamped:
+        value["clamped_fields"] = ", ".join(clamped)
     value["score_total"] = (
         value["core_intent"]
         + value["rhetorical_signal"]
@@ -139,6 +163,9 @@ def judge_one(
     repetition_penalty: float,
     enable_thinking: bool,
     max_retries: int,
+    use_audio_in_video: bool = False,
+    audio_chunk_seconds: float | None = None,
+    clamp_out_of_range: bool = False,
 ) -> dict:
     encoded = base64.b64encode(video_path.read_bytes()).decode("ascii")
     content = [
@@ -149,47 +176,77 @@ def judge_one(
             "url": f"data:video/mp4;base64,{encoded}",
         }},
     ]
+    # vLLM does not decode the MP4's embedded audio track, so a judge that can
+    # hear still receives a silent video unless the audio is attached as its own
+    # input. The grounding dimension asks about speech and audio evidence, and
+    # 839 of the 1000 clips carry their meaning there, so this is not optional
+    # for an omni judge.
+    audio_tempdir = None
+    if use_audio_in_video and has_audio(video_path):
+        audio_tempdir = tempfile.TemporaryDirectory(prefix="drivelhub-judge-")
+        audio_path = Path(audio_tempdir.name) / "audio.wav"
+        extract_audio(video_path, audio_path)
+        # The judge hits the same ceiling as the systems it grades: vLLM caps
+        # MiniCPM-O at 30 one-second audio chunks, and a longer track is
+        # rejected with a 400 rather than truncated. Splitting keeps the whole
+        # soundtrack inside the cap.
+        parts = ([audio_path] if not audio_chunk_seconds
+                 else split_wav(audio_path, audio_chunk_seconds))
+        for part in parts:
+            audio_encoded = base64.b64encode(part.read_bytes()).decode("ascii")
+            content.append({"type": "audio_url", "audio_url": {
+                "url": f"data:audio/wav;base64,{audio_encoded}",
+            }})
     last_error: Exception | None = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            request_content = content
-            if last_error is not None:
-                request_content = content + [{
-                    "type": "text",
-                    "text": (
-                        f"Your previous response was invalid: {last_error}. "
-                        "Return a new JSON object and strictly obey every integer "
-                        "range stated above; do not reuse the invalid value."
-                    ),
-                }]
-            response = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": request_content}],
-                response_format={"type": "json_object"},
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                presence_penalty=presence_penalty,
-                extra_body={
-                    "top_k": top_k,
-                    "min_p": min_p,
-                    "repetition_penalty": repetition_penalty,
-                    "chat_template_kwargs": {
-                        "enable_thinking": enable_thinking,
-                        "thinking": enable_thinking,
+    try:
+        for attempt in range(1, max_retries + 1):
+            try:
+                request_content = content
+                if last_error is not None:
+                    request_content = content + [{
+                        "type": "text",
+                        "text": (
+                            f"Your previous response was invalid: {last_error}. "
+                            "Return a new JSON object and strictly obey every integer "
+                            "range stated above; do not reuse the invalid value."
+                        ),
+                    }]
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": request_content}],
+                    response_format={"type": "json_object"},
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    presence_penalty=presence_penalty,
+                    extra_body={
+                        "top_k": top_k,
+                        "min_p": min_p,
+                        "repetition_penalty": repetition_penalty,
+                        "chat_template_kwargs": {
+                            "enable_thinking": enable_thinking,
+                            "thinking": enable_thinking,
+                        },
                     },
-                },
-            )
-            answer = response.choices[0].message.content
-            if not answer:
-                raise RuntimeError("empty judge response")
-            return parse_json_object(answer)
-        except Exception as exc:
-            last_error = exc
-            print(f"retry {attempt}/{max_retries} for {video_path.name}: {exc}")
-            if attempt < max_retries:
-                time.sleep(min(2**attempt, 30))
-    raise RuntimeError(f"failed after {max_retries} attempts: {last_error}")
+                )
+                answer = response.choices[0].message.content
+                if not answer:
+                    raise RuntimeError("empty judge response")
+                # Only the final attempt may repair an out-of-range value, so a
+                # judge that can answer correctly still gets every chance to.
+                return parse_json_object(
+                    answer,
+                    clamp=clamp_out_of_range and attempt == max_retries,
+                )
+            except Exception as exc:
+                last_error = exc
+                print(f"retry {attempt}/{max_retries} for {video_path.name}: {exc}")
+                if attempt < max_retries:
+                    time.sleep(min(2**attempt, 30))
+        raise RuntimeError(f"failed after {max_retries} attempts: {last_error}")
+    finally:
+        if audio_tempdir is not None:
+            audio_tempdir.cleanup()
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -238,6 +295,12 @@ def judge_row(row: dict, args: argparse.Namespace, client: OpenAI) -> dict:
     filename = row["file"]
     video_path = args.data_dir / filename
     record = dict(row)
+    # Provenance: judgments used to carry no trace of which model graded them,
+    # so a rescored run was indistinguishable from an old one on disk.
+    record["judge_model"] = args.model
+    record["judge_use_audio_in_video"] = args.use_audio_in_video
+    if args.audio_chunk_seconds:
+        record["judge_audio_chunk_seconds"] = args.audio_chunk_seconds
     try:
         judgment = judge_one(
             client, args.model, video_path, str(row["annotation"]).strip(),
@@ -245,6 +308,8 @@ def judge_row(row: dict, args: argparse.Namespace, client: OpenAI) -> dict:
             args.temperature, args.top_p, args.top_k, args.min_p,
             args.presence_penalty, args.repetition_penalty,
             args.enable_thinking, args.max_retries,
+            args.use_audio_in_video, args.audio_chunk_seconds,
+            args.clamp_out_of_range,
         )
         for key, value in judgment.items():
             output_key = (
@@ -282,6 +347,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--presence-penalty", type=float, default=1.5)
     parser.add_argument("--repetition-penalty", type=float, default=1.0)
     parser.add_argument("--enable-thinking", action="store_true")
+    parser.add_argument(
+        "--use-audio-in-video",
+        action="store_true",
+        help=(
+            "Attach the clip's audio track as a separate audio input. Required "
+            "for an omni judge: vLLM does not decode the MP4's embedded audio, "
+            "so without this the judge grades a silent video."
+        ),
+    )
     parser.add_argument("--max-retries", type=int, default=10)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--limit", type=int)
@@ -295,6 +369,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--include-error-rows", action="store_true")
+    parser.add_argument(
+        "--clamp-out-of-range",
+        action="store_true",
+        help=(
+            "On the last attempt, pull an out-of-range integer back to its "
+            "rubric bound and record it in judge_clamped_fields rather than "
+            "discarding the judgment."
+        ),
+    )
+    parser.add_argument(
+        "--audio-chunk-seconds",
+        type=float,
+        help=(
+            "Split the attached soundtrack into chunks of at most this many "
+            "seconds. Needed for MiniCPM-O, which vLLM caps at 30 one-second "
+            "audio chunks per request."
+        ),
+    )
     return parser.parse_args()
 
 

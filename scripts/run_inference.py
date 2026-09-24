@@ -106,10 +106,48 @@ AUDIO_ONLY_PROMPT = """Output only a short explanation of the audio's core meani
 - No opening phrases like “The audio says...” or “This audio means...”.
 - No unnecessary analysis, background context, or moral commentary."""
 
+CASCADE_PROMPT = """Output only a short explanation of the video's core meaning or implied message. Do not add titles, quotation marks, introductions, bullet points, numbering, or extra formatting.
+
+[Modality Rule — Highest Priority]
+- You do not receive the video. You receive a text rendering of it: a speech transcript produced by an automatic speech recogniser, and the on-screen text produced by an optical character recogniser.
+- Either field may be empty, garbled, or out of order; the OCR lines are collected from sampled frames, so they carry no reliable ordering or timing.
+- Work from that text alone. Do NOT say that the video, the audio, or the frames are missing, and do NOT describe what you cannot see.
+
+[Language Rule — Highest Priority]
+- Detect the primary language from the transcript and the on-screen text.
+- The response MUST be written entirely in that same language.
+- Do not translate, mix languages, or add explanations in another language.
+- If the material is mainly English, respond fully in English. If mainly Chinese, respond fully in Chinese, etc.
+
+[Content Rule]
+- Explain the underlying meaning, emotion, joke, sarcasm, irony, or social implication.
+- Do NOT simply repeat or summarise the transcript line by line.
+- Avoid repeating the exact words unless absolutely necessary.
+- Focus on interpretation rather than transcription.
+
+[Style Rule]
+- Keep it concise: usually 1-2 sentences, maximum 3 short sentences.
+- Write naturally as a single paragraph only.
+- No bullet points, lists, headers, labels, or markdown.
+- No opening phrases like “This video shows...” or “The video means...”.
+- No unnecessary analysis, background context, or moral commentary.
+
+If the output language does not match the material's primary language, the response is considered incorrect.
+
+[Speech transcript]
+{transcript}
+
+[On-screen text]
+{on_screen}"""
+
+
 PROMPTS = {
     "full": FULL_PROMPT,
     "without-audio": VISION_ONLY_PROMPT,
     "without-vision": AUDIO_ONLY_PROMPT,
+    # The cascaded baseline sends no media at all; its prompt is filled in
+    # per clip from the OCR and ASR output.
+    "text-cascade": CASCADE_PROMPT,
 }
 
 
@@ -142,6 +180,38 @@ def extract_audio(video_path: Path, output_path: Path) -> None:
                 output.writeframes(resampled.to_ndarray().tobytes())
 
 
+def split_wav(source: Path, chunk_seconds: float) -> list[Path]:
+    """Split a 16 kHz mono WAV into chunks of at most `chunk_seconds`.
+
+    vLLM's MiniCPM-O support hardcodes a ceiling of 30 audio chunks, and the
+    checkpoint declares `audio_chunk_length` of 1.0s, so anything past 30s of
+    audio is rejected outright rather than degrading. Splitting the track keeps
+    every second of it inside that ceiling. This works on the decoded WAV, so
+    the audio is not resampled or re-encoded a second time.
+    """
+    with wave.open(str(source), "rb") as handle:
+        params = handle.getparams()
+        frames_per_chunk = int(chunk_seconds * params.framerate)
+        if frames_per_chunk <= 0 or params.nframes <= frames_per_chunk:
+            return [source]
+        chunks: list[Path] = []
+        index = 0
+        while True:
+            handle.setpos(min(index * frames_per_chunk, params.nframes))
+            data = handle.readframes(frames_per_chunk)
+            if not data:
+                break
+            part = source.with_name(f"{source.stem}_{index:03d}.wav")
+            with wave.open(str(part), "wb") as out:
+                out.setnchannels(params.nchannels)
+                out.setsampwidth(params.sampwidth)
+                out.setframerate(params.framerate)
+                out.writeframes(data)
+            chunks.append(part)
+            index += 1
+    return chunks
+
+
 def strip_audio(video_path: Path, output_path: Path) -> None:
     """Remux the first video stream into a new MP4 without audio streams."""
     with av.open(str(video_path)) as source:
@@ -159,7 +229,8 @@ def strip_audio(video_path: Path, output_path: Path) -> None:
 
 @contextmanager
 def prepared_media(
-    video_path: Path, mode: str, use_audio_in_video: bool = False
+    video_path: Path, mode: str, use_audio_in_video: bool = False,
+    audio_chunk_seconds: float | None = None,
 ) -> Iterator[list[tuple[Path, str, str]]]:
     if mode == "full":
         if not use_audio_in_video:
@@ -174,9 +245,11 @@ def prepared_media(
             extract_audio(video_path, audio_path)
             # vLLM serve does not interleave embedded video audio for Qwen3-Omni.
             # The model's official serving example sends video and audio separately.
+            parts = ([audio_path] if not audio_chunk_seconds
+                     else split_wav(audio_path, audio_chunk_seconds))
             yield [
                 (video_path, "video", "video/mp4"),
-                (audio_path, "audio", "audio/wav"),
+                *((part, "audio", "audio/wav") for part in parts),
             ]
         return
 
@@ -213,8 +286,22 @@ def generate(
     top_k: int | None,
     use_audio_in_video: bool,
     max_retries: int,
+    audio_chunk_seconds: float | None = None,
+    cascade_text: dict[str, str] | None = None,
 ) -> str:
-    with prepared_media(video_path, mode, use_audio_in_video) as prepared:
+    # The cascaded baseline is text-only: no frames, no soundtrack, just the
+    # OCR and ASR rendering of the clip.
+    if mode == "text-cascade":
+        prompt = PROMPTS[mode].format(
+            transcript=(cascade_text or {}).get("transcript") or "(none)",
+            on_screen=(cascade_text or {}).get("on_screen") or "(none)",
+        )
+        return _complete(client, model, [{"type": "text", "text": prompt}],
+                         enable_thinking, max_tokens, temperature, top_p, top_k,
+                         max_retries, video_path.name)
+
+    with prepared_media(video_path, mode, use_audio_in_video,
+                        audio_chunk_seconds) as prepared:
         media = [
             {
                 "type": f"{media_kind}_url",
@@ -224,38 +311,67 @@ def generate(
         ]
         content = [*media, {"type": "text", "text": PROMPTS[mode]}]
 
-        last_error: Exception | None = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                extra_body: dict = {
-                    "chat_template_kwargs": {
-                        "enable_thinking": enable_thinking,
-                        "thinking": enable_thinking,
-                    },
-                }
-                if top_k is not None:
-                    extra_body["top_k"] = top_k
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": content}],
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    extra_body=extra_body,
-                )
-                answer = response.choices[0].message.content
-                if not answer or not answer.strip():
-                    raise RuntimeError("empty model response")
-                answer = final_answer(answer)
-                if not answer:
-                    raise RuntimeError("empty model response after removing reasoning")
-                return answer
-            except Exception as exc:  # API clients expose backend-specific errors.
-                last_error = exc
-                print(f"retry {attempt}/{max_retries} for {video_path.name}: {exc}")
-                if attempt < max_retries:
-                    time.sleep(min(2**attempt, 30))
-        raise RuntimeError(f"failed after {max_retries} attempts: {last_error}")
+        return _complete(client, model, content, enable_thinking, max_tokens,
+                         temperature, top_p, top_k, max_retries, video_path.name)
+
+
+def _complete(
+    client: OpenAI,
+    model: str,
+    content: list[dict],
+    enable_thinking: bool,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int | None,
+    max_retries: int,
+    label: str,
+) -> str:
+    last_error: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            extra_body: dict = {
+                "chat_template_kwargs": {
+                    "enable_thinking": enable_thinking,
+                    "thinking": enable_thinking,
+                },
+            }
+            if top_k is not None:
+                extra_body["top_k"] = top_k
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": content}],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                extra_body=extra_body,
+            )
+            answer = response.choices[0].message.content
+            if not answer or not answer.strip():
+                raise RuntimeError("empty model response")
+            answer = final_answer(answer)
+            if not answer:
+                raise RuntimeError("empty model response after removing reasoning")
+            return answer
+        except Exception as exc:  # API clients expose backend-specific errors.
+            last_error = exc
+            print(f"retry {attempt}/{max_retries} for {label}: {exc}")
+            if attempt < max_retries:
+                time.sleep(min(2**attempt, 30))
+    raise RuntimeError(f"failed after {max_retries} attempts: {last_error}")
+
+
+def load_cascade_text(path: Path | None) -> dict[str, str]:
+    """Map filename -> extracted text, for one half of the cascade prompt."""
+    if path is None:
+        return {}
+    out: dict[str, str] = {}
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                row = json.loads(line)
+                out[row["file"]] = (row.get("text") or "").strip()
+    return out
 
 
 def load_completed(path: Path) -> set[str]:
@@ -294,6 +410,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metadata-csv", type=Path, default=Path("metadata.csv"))
     parser.add_argument("--output-jsonl", type=Path, required=True)
     parser.add_argument("--mode", choices=tuple(PROMPTS), default="full")
+    parser.add_argument(
+        "--cascade-asr", type=Path,
+        help="JSONL from scripts/extract_cascade_text.py --stage asr; the "
+             "speech half of the text-cascade prompt.",
+    )
+    parser.add_argument(
+        "--cascade-ocr", type=Path,
+        help="JSONL of on-screen text; the OCR half of the text-cascade prompt.",
+    )
     parser.add_argument("--enable-thinking", action="store_true")
     parser.add_argument("--max-tokens", type=int, default=8192)
     parser.add_argument("--temperature", type=float, default=0.7)
@@ -318,6 +443,15 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of concurrent requests sent to vLLM (default: 1).",
     )
+    parser.add_argument(
+        "--audio-chunk-seconds",
+        type=float,
+        help=(
+            "Split the attached audio into chunks of at most this many seconds. "
+            "vLLM caps MiniCPM-O at 30 audio chunks of 1s, so a longer clip is "
+            "rejected outright; 30 keeps every second of audio within that cap."
+        ),
+    )
     parser.add_argument("--limit", type=int)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -331,16 +465,33 @@ def infer_row(
     record = {
         **row,
         "video_path": str(video_path),
+        "model": args.model,
         "input_mode": args.mode,
         "remove_audio": args.mode == "without-audio",
         "remove_vision": args.mode == "without-vision",
+        # remove_audio only reflects the ablation mode. Whether the audio track
+        # actually reached the model is a separate fact: without this flag vLLM
+        # never decodes the MP4's embedded audio, so a "full" run can be silently
+        # vision-only. Record it so a run's modality coverage is auditable.
+        "use_audio_in_video": args.use_audio_in_video,
+        "audio_chunk_seconds": args.audio_chunk_seconds,
     }
+    cascade_text = None
+    if args.mode == "text-cascade":
+        cascade_text = {
+            "transcript": args.cascade_asr_text.get(filename, ""),
+            "on_screen": args.cascade_ocr_text.get(filename, ""),
+        }
+        record["cascade_transcript_chars"] = len(cascade_text["transcript"])
+        record["cascade_on_screen_chars"] = len(cascade_text["on_screen"])
     try:
         record["implicit_meaning"] = generate(
             client, args.model, video_path, args.mode, args.enable_thinking,
             args.max_tokens, args.temperature, args.top_p, args.top_k,
             args.use_audio_in_video,
             args.max_retries,
+            args.audio_chunk_seconds,
+            cascade_text,
         )
     except Exception as exc:
         record["implicit_meaning"] = ""
@@ -355,6 +506,12 @@ def main() -> None:
         raise ValueError("--workers must be at least 1")
     if args.use_audio_in_video and args.mode != "full":
         raise ValueError("--use-audio-in-video is only valid with --mode full")
+    if args.mode == "text-cascade" and not (args.cascade_asr or args.cascade_ocr):
+        raise ValueError("--mode text-cascade needs --cascade-asr and/or --cascade-ocr")
+    # Either half may be left out on purpose: that is what makes the
+    # transcript-only and caption-only conditions.
+    args.cascade_asr_text = load_cascade_text(args.cascade_asr)
+    args.cascade_ocr_text = load_cascade_text(args.cascade_ocr)
     if args.overwrite and args.output_jsonl.exists():
         args.output_jsonl.unlink()
     completed = load_completed(args.output_jsonl)

@@ -1,22 +1,95 @@
 # Environment installation
 
-This project uses the Conda environment `drivelology`. The validated serving
-stack targets the cluster's ARM64 NVIDIA GH200 nodes and CUDA 12.x driver.
+This project uses the Conda environment `drivelology`, under the Conda root at
+`/lus/lfs1aip2/scratch/u6sn/yangw.u6sn/miniforge3` (reachable as
+`/scratch/u6sn/yangw.u6sn/miniforge3`; there is no `miniforge3` in `$HOME`).
+The validated serving stack targets the cluster's ARM64 NVIDIA GH200 nodes and
+CUDA 12.x driver.
 
-Run installation on a login node, where GitHub and package downloads are much
-faster than on interactive GPU nodes. The Conda environment is on the shared
+Building the environment is compute, so submit it rather than running it in a
+login shell — see [CLAUDE.md](CLAUDE.md). The environment lives on the shared
 filesystem, so it is immediately available inside a later Slurm allocation.
 
 ```bash
+sbatch --partition=interactive --reservation=interactive --time=4:00:00 \
+  --gres=gpu:1 --cpus-per-task=32 install_drivelology.sbatch
+```
+
+The job requests one GPU so that it can run the verification below in the same
+allocation. The steps it performs are:
+
+```bash
+CONDA_ROOT=/lus/lfs1aip2/scratch/u6sn/yangw.u6sn/miniforge3
+source "$CONDA_ROOT/etc/profile.d/conda.sh"
+conda activate base
+
+# uv is not in the lock, so it must not live in drivelology (see below).
+mamba install -y -c conda-forge uv
+
 conda create -n drivelology python=3.12 -y
-conda activate drivelology
 
 export UV_LINK_MODE=copy
 export UV_HTTP_TIMEOUT=600
 export UV_CACHE_DIR="/scratch/u6sn/${USER}/uv-cache"
+export TMPDIR=/scratch/u6sn/yangw.u6sn/tmp/drivel-hub-plus
 
-uv pip sync requirements-vllm.lock.txt --torch-backend=cu129
+"$CONDA_ROOT/bin/uv" pip sync requirements-vllm.lock.txt \
+  --python "$CONDA_ROOT/envs/drivelology/bin/python" \
+  --torch-backend=cu129
 ```
+
+## What each non-obvious pin is for
+
+Most entries in `requirements-vllm.txt` are the serving stack. These are the
+ones whose absence produces a confusing failure rather than an obvious one:
+
+| Package | Needed by | Symptom when missing |
+| --- | --- | --- |
+| `librosa`, `soundfile` | `vllm[audio]` | Every `audio_url` request returns HTTP 500, `Please install vllm[audio] for audio support`. Silently makes every omni run vision-only. |
+| `av` | `run_inference.py` | `ModuleNotFoundError: av`; no audio extraction and no vision-only remux. |
+| `peft` | `jina-embeddings-v5-omni` remote code | `AutoProcessor.from_pretrained` refuses to load: "requires the following packages that were not found: peft". |
+| `qwen-omni-utils` | `generate_embeddings.py --backend qwen-hidden-state` | LCO-Embedding, e5-omni and Qwen2.5-Omni retrieval runs die on import. |
+| `sentence-transformers` | `--backend st-omni` | Omni-Embed-Nemotron ships as a SentenceTransformers module, not an `AutoModel`. |
+
+## Keep uv out of `drivelology`
+
+`uv pip sync` uninstalls every package the lock does not list, and
+`requirements-vllm.lock.txt` does not list `uv`. Installing uv into
+`drivelology` therefore makes the sync delete the tool running it, leaving a
+half-synced environment. Keep uv in the base env, call it by absolute path, and
+point it at the target interpreter with `--python`.
+
+`--python` also removes the need to activate `drivelology` before syncing, so
+the job never depends on which env happens to be active.
+
+## CUDA libraries from the HPC SDK
+
+The compute image ships `/opt/nvidia/hpc_sdk/Linux_aarch64/24.11/cuda/12.6/lib64`
+on `LD_LIBRARY_PATH`, and that directory contains `libnvJitLink.so.12` at
+version 12.6.77. The CUDA 12.9 wheels pinned here need a newer one: their
+`libcusparse.so.12` references `__nvJitLinkGetErrorLogSize_12_9`, and the 12.6
+library only exports symbols up to `_12_6`. The dynamic loader consults
+`LD_LIBRARY_PATH` before torch's `RUNPATH`, so the system copy wins and
+`import torch` fails with:
+
+```
+ImportError: .../nvidia/cusparse/lib/libcusparse.so.12: undefined symbol:
+__nvJitLinkGetErrorLogSize_12_9, version libnvJitLink.so.12
+```
+
+`install_drivelology.sbatch` fixes this on the environment, not in each caller,
+by writing `etc/conda/activate.d/10-cuda-wheel-libs.sh`. The hook prepends every
+`site-packages/nvidia/*/lib` directory to `LD_LIBRARY_PATH`, and the matching
+`deactivate.d` hook restores the previous value. `conda activate drivelology` is
+therefore enough — `serve_vllm.sh`, `run_inference.py` and `video_llm_judge.py`
+need no change. Confirm it with:
+
+```bash
+ldd "$CONDA_PREFIX/lib/python3.12/site-packages/nvidia/cusparse/lib/libcusparse.so.12" \
+  | grep nvjitlink
+```
+
+It must resolve inside `$CONDA_PREFIX`, not under `/opt/nvidia/hpc_sdk`.
 
 Use `requirements-vllm.lock.txt` to reproduce the tested environment. It pins
 the complete transitive dependency graph, including hashes and the CUDA 12.9
@@ -38,11 +111,16 @@ designed around a `pyproject.toml` project and normally creates/manages a
 `drivelology`.
 
 When intentionally changing a top-level pin, edit `requirements-vllm.txt` and
-regenerate the ARM64 lock on a login node:
+regenerate the ARM64 lock. Resolution only reads package metadata and installs
+nothing, so it is cheap enough for a login shell.
+
+Compile against `manylinux_2_34`, not `2_31`. The nodes run glibc 2.38, and the
+older tag silently drops wheels built for 2.34 — which is how a `tilelang`
+aarch64 wheel that exists on PyPI came back as "no solution found":
 
 ```bash
 uv pip compile requirements-vllm.txt \
-  --python-platform aarch64-manylinux_2_31 \
+  --python-platform aarch64-manylinux_2_34 \
   --python-version 3.12 \
   --torch-backend=cu129 \
   --only-binary=:all: \
@@ -50,9 +128,22 @@ uv pip compile requirements-vllm.txt \
   --output-file requirements-vllm.lock.txt
 ```
 
+## Updating the env while jobs are running
+
+`uv pip sync` removes whatever the lock does not list, so a sync can break a
+running job mid-flight. Before syncing a shared env that something is using,
+diff the two locks and confirm the change is purely additive — no removals and
+no version changes. Adding packages is safe, because a running process has
+already imported what it needs; changing or removing them is not.
+
+`update_env.sbatch` performs the sync and then loads the interfaces that were
+previously failing, rather than only checking that the packages import.
+
 ## Verify on a GPU node
 
-After requesting a Slurm GPU allocation, activate `drivelology` and run:
+`install_drivelology.sbatch` runs this check at the end of the build, so the
+install log already contains the output. To re-check by hand, request a Slurm
+GPU allocation, activate `drivelology` and run:
 
 ```bash
 python - <<'PY'
@@ -105,10 +196,13 @@ Expected core versions are:
 
 ## Troubleshooting
 
-- Package downloads time out on a GPU compute node: leave the Slurm shell
-  running and install from a login shell into the same shared Conda
-  environment. Keep uv's cache on scratch and rerun; completed wheels are
-  reused.
+- Package downloads time out on a GPU compute node: keep uv's cache on scratch
+  (`UV_CACHE_DIR`) and resubmit — completed wheels are reused, so the retry
+  resumes rather than restarts. Only if the job keeps timing out, fall back to
+  installing from a login shell into the same shared Conda environment.
+- `uv: command not found` partway through, or a sync that ends with fewer
+  packages than the lock: uv was installed into `drivelology` and the sync
+  removed it. Reinstall uv into the base env and resync.
 - `The NVIDIA driver on your system is too old`: a CUDA 13 PyTorch wheel was
   installed accidentally. Force the CUDA 12.9 build with
   `uv pip install --reinstall torch==2.10.0 torchvision==0.25.0
@@ -119,6 +213,9 @@ Expected core versions are:
   FlashAttention build and reinstall the exact wheel pinned in
   `requirements-vllm.txt`.
 - `Numba needs NumPy 2.2 or less`: restore `numpy==2.2.6`.
+- `undefined symbol: __nvJitLinkGetErrorLogSize_12_9`: the HPC SDK's CUDA 12.6
+  libraries are shadowing the wheels. See "CUDA libraries from the HPC SDK";
+  the activation hook is missing or the env was not activated through conda.
 - `ModuleNotFoundError: av`: sync the lock again. Qwen3-Omni full-video input
   and the audio/vision ablation modes require the pinned PyAV package.
 - uv hardlink warning: keep `UV_LINK_MODE=copy`; home and scratch are different

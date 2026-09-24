@@ -14,3 +14,47 @@ fsspec==2026.6.0
 openai==3.1.0
 hjson==3.1.0
 av==18.1.0
+
+# vllm[audio]. Without these, the server rejects every audio_url input with
+# "Please install vllm[audio] for audio support", so no omni model ever
+# receives the audio track.
+librosa
+soundfile
+
+# scripts/generate_embeddings.py --backend qwen-hidden-state imports this to
+# prepare video and audio inputs for Qwen2.5-Omni-derived retrieval models
+# (LCO-Embedding, e5-omni, and Qwen2.5-Omni itself).
+qwen-omni-utils
+# qwen-omni-utils imports audioread without declaring it, and librosa 1.0 no
+# longer pulls it in, so the resolver leaves it out and the import fails.
+audioread
+
+# Omni-Embed-Nemotron ships as a SentenceTransformers module and is loaded
+# through it rather than through AutoModel.
+sentence-transformers
+
+# jina-embeddings-v5-omni's remote modeling code imports peft to apply its
+# task-specific LoRA adapters, and refuses to load without it.
+peft
+
+# scripts/retrieval.py computes recall/MRR/NDCG with ranx.
+ranx
+
+# qwen_omni_utils falls back to its torchvision video reader, which decodes
+# every frame into memory before sampling: a 235s 1080p clip needs ~44 GB and
+# the process is OOM-killed. torchcodec streams instead, and qwen_omni_utils
+# prefers it when present.
+torchcodec
+
+# scripts/extract_cascade_text.py runs the OCR half of the cascaded baseline.
+# Install it with --no-deps: resolving easyocr's full tree relinks
+# nvidia-cusparselt-cu12, and the CUDA wheels under this env are the ones the
+# activate.d hook puts on LD_LIBRARY_PATH. Its remaining deps (torch,
+# torchvision, opencv, scipy, Pillow, PyYAML, ninja) are already pinned above.
+easyocr
+imageio
+pyclipper
+python-bidi
+scikit-image
+shapely
+tifffile

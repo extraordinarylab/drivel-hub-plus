@@ -6,6 +6,24 @@ Code for evaluating implicit and non-literal meaning understanding in social med
 
 The scripts expect `metadata.csv`, `qrels.json`, and a local directory containing the corresponding MP4 files.
 
+`metadata.csv` covers 1000 videos, one row each, and carries two independent
+human readings of every clip:
+
+| Column | Meaning |
+| --- | --- |
+| `file` | MP4 filename inside the data directory |
+| `link` | original post the clip came from |
+| `type`, `source` | media type and platform |
+| `annotator` | who wrote `human_baseline` |
+| `annotation` | **the ground truth.** `run_inference.py` and `video_llm_judge.py` score against this column |
+| `human_baseline` | a second annotator's independent reading of the same clip, scored the same way to give a human reference point |
+| `modalities`, `speech`, `caption` | which channels carry the meaning, and their languages |
+| `verified`, `remark` | review status and free-text notes |
+
+`annotation` and `human_baseline` differ on 998 of the 1000 rows, so a model
+scored against `annotation` and the human scored against the same column are
+directly comparable.
+
 Install the validated Python environment by following [INSTALL.md](INSTALL.md).
 
 ## Run vLLM and inference on Slurm
@@ -116,6 +134,8 @@ server_pids+=("$!")
 `nvcc`. The serving wrapper defaults to `--mm-processor-cache-gb 0`, which
 avoids an observed vLLM 0.19.1 multimodal cache consistency assertion during
 concurrent video requests.
+
+allenai/Molmo2-8B requires `--max-num-batched-tokens 32768` this setting.
 
 ### Start four independent one-GPU replicas
 
